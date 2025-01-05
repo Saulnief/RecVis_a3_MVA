@@ -85,6 +85,81 @@ def opts() -> argparse.ArgumentParser:
     return args
 
 
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+def log_confusion_matrix(model, val_loader, use_cuda):
+    all_preds = []
+    all_targets = []
+    model.eval()
+    for data, target in val_loader:
+        if use_cuda:
+            data, target = data.cuda(), target.cuda()
+        output = model(data)
+        pred = output.argmax(dim=1, keepdim=True).view(-1)
+        all_preds.extend(pred.cpu().numpy())
+        all_targets.extend(target.cpu().numpy())
+
+    cm = confusion_matrix(all_targets, all_preds)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+    ax.set_xlabel("Predicted Labels")
+    ax.set_ylabel("True Labels")
+    ax.set_title("Confusion Matrix")
+    wandb.log({"Confusion Matrix": wandb.Image(fig)})
+    plt.close(fig)
+    
+import torch.nn.functional as F
+
+class WeightedFocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        """
+        Multi-Class Focal Loss.
+        Args:
+            alpha (list, tensor, or None): Class weights (size = num_classes). If None, equal weights are applied.
+            gamma (float): Focusing parameter gamma.
+        """
+        super(WeightedFocalLoss, self).__init__()
+        if alpha is not None:
+            self.alpha = torch.tensor(alpha, dtype=torch.float32)  # Convert to tensor
+        else:
+            self.alpha = None  # No class weighting
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: Logits of shape (batch_size, num_classes).
+            targets: Ground truth labels of shape (batch_size), with values in [0, num_classes-1].
+        Returns:
+            Scalar focal loss.
+        """
+        # Convert logits to probabilities
+        probs = F.softmax(inputs, dim=1)  # Shape: (batch_size, num_classes)
+        
+        # Gather probabilities of the true class
+        targets = targets.view(-1, 1)  # Shape: (batch_size, 1)
+        p_t = probs.gather(1, targets).squeeze(1)  # Shape: (batch_size)
+        
+        # Compute the cross-entropy loss per sample
+        CE_loss = -torch.log(p_t)  # Shape: (batch_size)
+        
+        # Compute the focal loss factor
+        focal_factor = (1 - p_t) ** self.gamma  # Shape: (batch_size)
+        
+        # Apply alpha weighting if provided
+        if self.alpha is not None:
+            if inputs.is_cuda:
+                self.alpha = self.alpha.cuda()  # Ensure alpha is on the same device
+            alpha_t = self.alpha.gather(0, targets.squeeze(1))  # Shape: (batch_size)
+            CE_loss = CE_loss * alpha_t  # Scale the loss by alpha
+
+        # Compute final focal loss
+        F_loss = focal_factor * CE_loss
+        return F_loss.mean()
+
+
 def train(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -111,6 +186,7 @@ def train(
         optimizer.zero_grad()
         output = model(data)
         criterion = torch.nn.CrossEntropyLoss(reduction="mean")
+        #criterion = WeightedFocalLoss()
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
@@ -155,17 +231,23 @@ def validation(
     model.eval()
     validation_loss = 0
     correct = 0
+    all_preds = []
+    all_targets = []
     for data, target in val_loader:
         if use_cuda:
             data, target = data.cuda(), target.cuda()
         output = model(data)
         # sum up batch loss
         criterion = torch.nn.CrossEntropyLoss(reduction="mean")
+        #criterion = WeightedFocalLoss()
         validation_loss += criterion(output, target).data.item()
         # get the index of the max log-probability
         pred = output.data.max(1, keepdim=True)[1]
         correct += pred.eq(target.data.view_as(pred)).cpu().sum()
-
+        
+        all_preds.extend(pred.cpu().numpy())
+        all_targets.extend(target.cpu().numpy())
+        
     validation_loss /= len(val_loader.dataset)
     accuracy_loss = 100.0 * correct / len(val_loader.dataset)
     print(
@@ -176,7 +258,19 @@ def validation(
             100.0 * correct / len(val_loader.dataset),
         )
     )
+    
+    # Log confusion matrix
+    cm = confusion_matrix(all_targets, all_preds)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title("Confusion Matrix")
+    wandb.log({"Confusion Matrix": wandb.Image(fig)})
+    plt.close(fig)
+    
     return validation_loss, accuracy_loss
+
 
 
 def log_image_table(images, predicted, labels, probs):
